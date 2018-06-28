@@ -17,14 +17,15 @@ import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactor
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.lang.Nullable;
 import org.springframework.scheduling.TaskScheduler;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ConcurrentTaskScheduler;
-import org.springframework.session.data.redis.config.ConfigureRedisAction;
-import org.springframework.session.web.http.HeaderHttpSessionStrategy;
-import org.springframework.session.web.http.HttpSessionStrategy;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.support.WebDataBinderFactory;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.context.request.NativeWebRequest;
@@ -33,18 +34,32 @@ import org.springframework.web.method.support.ModelAndViewContainer;
 import org.springframework.web.servlet.config.annotation.CorsRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.MapperFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import kr.co.kstar.api.exception.KStarException;
+import kr.co.kstar.api.property.KStarApiProperty;
+
 @SpringBootApplication
 @EnableScheduling
 public class Application extends SpringBootServletInitializer{
-    final RestTemplate restTemplate;
-
-    public Application(RestTemplateBuilder restTemplateBuilder){
-        this.restTemplate=restTemplateBuilder.build();
-    }
-
     @Override
     protected SpringApplicationBuilder configure(SpringApplicationBuilder springApplicationBuilder){
         return springApplicationBuilder.sources(Application.class);
+    }
+
+    @Bean
+    public RestTemplate restTemplate(RestTemplateBuilder restTemplateBuilder){
+        return restTemplateBuilder.build();
+    }
+
+    @Bean
+    public ObjectMapper objectMapper(){
+        return  new ObjectMapper(){{
+            configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+            configure(MapperFeature.DEFAULT_VIEW_INCLUSION, true);
+        }};
     }
 
     @Bean
@@ -53,22 +68,13 @@ public class Application extends SpringBootServletInitializer{
     }
 
     @Bean
-    public HttpSessionStrategy httpSessionStrategy(){
-        return new HeaderHttpSessionStrategy();
-    }
-
-    @Bean
-    public static ConfigureRedisAction configureRedisAction(){
-        return ConfigureRedisAction.NO_OP;
-    }
-
-    @Bean
     public TaskScheduler taskScheduler(){
         return new ConcurrentTaskScheduler();
     }
 
+    private final Map<String, UserEntity> userMap=Collections.synchronizedMap(new HashMap());
     @Bean
-    public WebMvcConfigurer securityResolveArgumentConfig(){
+    public WebMvcConfigurer securityResolveArgumentConfig(RestTemplate restTemplate, KStarApiProperty kstarApiProperty){
         return new WebMvcConfigurer(){
             @Override
             public void addArgumentResolvers(List<HandlerMethodArgumentResolver> argumentResolvers){
@@ -81,31 +87,55 @@ public class Application extends SpringBootServletInitializer{
                     @Override @Nullable
                     public Object resolveArgument(MethodParameter parameter, @Nullable ModelAndViewContainer mavContainer, NativeWebRequest webRequest, @Nullable WebDataBinderFactory binderFactory){
                         if(parameter.getParameterType().equals(UserEntity.class)){
-                            HttpEntity httpEntity=new HttpEntity(new HttpHeaders(){{
-                                setAccept(Collections.singletonList(MediaType.APPLICATION_JSON));
-                                setContentType(MediaType.APPLICATION_JSON);
-                                set("Authorization", webRequest.getHeader("Authorization"));
-                            }});
-                            String a=restTemplate.exchange("https://dev.kstar.tv/api/member", HttpMethod.GET, httpEntity, String.class);
-
-                            return restTemplate.exchange("https://dev.kstar.tv/api/member", HttpMethod.GET, new HttpEntity(new HttpHeaders(){{
-                                setAccept(Collections.singletonList(MediaType.APPLICATION_JSON));
-                                setContentType(MediaType.APPLICATION_JSON);
-                                set("Authorization", webRequest.getHeader("Authorization"));
-                            }}), UserEntity.class);
+                            String authorization=webRequest.getHeader("Authorization");
+                            if(userMap.get(authorization)==null){
+                                HttpEntity httpEntity=new HttpEntity(new HttpHeaders(){{
+                                    setAccept(Collections.singletonList(MediaType.APPLICATION_JSON));
+                                    setContentType(MediaType.APPLICATION_JSON);
+                                    set("Authorization", authorization);
+                                }});
+                                userMap.put(authorization, restTemplate.exchange(kstarApiProperty.getUser("/api/member"), HttpMethod.GET, httpEntity, Data.class).getBody().data.setAuthorization(authorization));
+                            }
+                            return userMap.get(authorization).setIp(webRequest);
                         }
-                        throw new KStarException("401");
+                        throw new KStarException("401", HttpStatus.UNAUTHORIZED);
                     }
                 });
             }
         };
+    }
+    private static class Data{
+        public UserEntity data;
     }
 
     @Configuration
     public static class WebMvcConfig implements WebMvcConfigurer{
         @Override
         public void addCorsMappings(CorsRegistry registry){
-            registry.addMapping("/**");
+            registry.addMapping("/**")
+                    .allowedMethods("GET", "POST", "PUT");
+        }
+    }
+
+    @ControllerAdvice
+    public class ExceptionHandlingController{
+        @ExceptionHandler(KStarException.class)
+        public ResponseEntity handleBindingErrors(KStarException e){
+            e.printStackTrace();
+
+            return new ResponseEntity(new HashMap(){{
+                put("code", e.getCode());
+            }}, e.getStatus());
+        }
+
+        @ExceptionHandler(Throwable.class)
+        public ResponseEntity handleBindingErrors(Throwable t){
+            t.printStackTrace();
+
+            return new ResponseEntity(new HashMap(){{
+                put("code", "0");
+                put("message", t.getMessage());
+            }}, HttpStatus.INTERNAL_SERVER_ERROR);
         }
     }
 
